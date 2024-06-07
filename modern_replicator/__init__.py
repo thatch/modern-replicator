@@ -1,4 +1,5 @@
 import logging
+import mmap
 import os
 import re
 import ssl
@@ -27,14 +28,16 @@ class CacheEntry:
         self.have_length = threading.Event()
         self.file_complete = threading.Event()
         self.fd = None
+        self.mmap = None
         self.length = 0
         self.sofar = 0
 
     def check_already_cached(self) -> bool:
         if self.cache_path.exists():
-            self.fd = open(self.cache_path)
+            self.fd = open(self.cache_path, "rb")
             self.length = self.cache_path.stat().st_size
             self.sofar = self.length
+            self.mmap = mmap.mmap(self.fd.fileno(), self.length, prot=mmap.PROT_READ)
             self.have_length.set()
             self.file_complete.set()
             return True
@@ -43,30 +46,28 @@ class CacheEntry:
     def send_to_client(self, wfile, cur=0):
         self.have_length.wait()
         assert self.fd is not None, "send_to_client only after fd set"
-        fd = os.fdopen(os.dup(self.fd.fileno()), "rb", buffering=0)
-        try:
-            while True:
-                fd.seek(cur, os.SEEK_SET)
-                if cur == self.length and self.file_complete.is_set():
-                    # print("bail")
-                    break
-                rem = min(self.sofar - cur, CHUNK)
+        assert self.mmap is not None, "send_to_client only after mmap set"
+        while True:
+            if cur == self.length and self.file_complete.is_set():
+                # print("bail")
+                break
+            rem = min(self.sofar - cur, CHUNK)
 
-                if rem == 0:
-                    # print("sleep")
-                    time.sleep(0.5)
-                    continue
-                chunk = fd.read(rem)
-                if chunk == b"":
-                    continue
-                try:
-                    wfile.write(chunk)
-                    wfile.flush()
-                except ssl.SSLEOFError:
-                    break
-                cur += len(chunk)
-        finally:
-            fd.close()
+            if rem == 0:
+                # print("sleep")
+                time.sleep(0.5)
+                continue
+            chunk = self.mmap[cur : cur + rem]
+
+            try:
+                wfile.write(chunk)
+                wfile.flush()
+            except ssl.SSLEOFError:
+                break
+
+            if rem != len(chunk):
+                print("ERROR")
+            cur += len(chunk)
 
     def save_to_disk(self, rfile, length):
         with rfile:
@@ -74,20 +75,20 @@ class CacheEntry:
             Path(self.cache_path).parent.mkdir(exist_ok=True, parents=True)
             assert self.fd is None, "Only call save_to_disk once"
             # TODO truncates for now, until I deal with header parsing more
-            with open(self.cache_path.as_posix() + ".incomplete", "w+b", buffering=0):
-                pass
             self.fd = open(
-                self.cache_path.as_posix() + ".incomplete", "r+b", buffering=0
+                self.cache_path.as_posix() + ".incomplete", "w+b", buffering=0
             )
+            self.fd.seek(length, os.SEEK_SET)
+            self.fd.truncate()
+
+            self.mmap = mmap.mmap(self.fd.fileno(), length)
             self.have_length.set()
             cur = 0
             while True:
                 chunk = rfile.read(CHUNK)
                 if not chunk:
                     break
-                self.fd.seek(cur, os.SEEK_SET)
-                self.fd.write(chunk)
-                self.fd.flush()
+                self.mmap[cur : cur + len(chunk)] = chunk
                 cur += len(chunk)
                 # print(cur, self.fd.tell())
                 self.sofar = cur
