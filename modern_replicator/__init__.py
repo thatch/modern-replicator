@@ -2,6 +2,8 @@ import logging
 import mmap
 import os
 import re
+import selectors
+import socketserver
 import ssl
 import sys
 import threading
@@ -142,20 +144,42 @@ class ProxyHandler(BaseHTTPRequestHandler):
             ce.send_to_client(self.wfile)
 
 
-def run(server_class=ThreadingHTTPServer, handler_class=ProxyHandler):
-    server_address = ("", 443)
-    httpd = server_class(server_address, handler_class)
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.load_cert_chain(
-        "/home/tim/pki/inline/mirror.inline", "/home/tim/pki/private/mirror.key"
-    )
-    httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
-    httpd.serve_forever()
+def coserv(*servers):
+    with socketserver._ServerSelector() as selector:
+        for s in servers:
+            selector.register(s, selectors.EVENT_READ)
+        while True:
+            ready = selector.select(10)
+            for key, event in ready:
+                key.fileobj._handle_request_noblock()
 
 
-def main():
+def run(
+    bind,
+    server_class=ThreadingHTTPServer,
+    handler_class=ProxyHandler,
+    ssl_cert=None,
+    ssl_key=None,
+):
+    httpd = server_class(bind, handler_class)
+    if ssl_key:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(ssl_cert, ssl_key)
+        httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+    return httpd
+
+
+@click.command()
+@click.option("--ssl-cert")
+@click.option("--ssl-key")
+@click.option("--http-port", default=80)
+@click.option("--https-port", default=443)
+def main(ssl_cert, ssl_key, http_port, https_port):
     logging.basicConfig(level=logging.DEBUG)
-    run()
+    servers = [run(bind=("", http_port))]
+    if ssl_key:
+        servers.append(run(bind=("", https_port), ssl_cert=ssl_cert, ssl_key=ssl_key))
+    coserv(*servers)
 
 
 if __name__ == "__main__":
