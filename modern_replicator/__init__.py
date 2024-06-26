@@ -1,3 +1,4 @@
+import hashlib
 import pwd
 import logging
 import mmap
@@ -19,35 +20,58 @@ from typing import Optional, Tuple
 import click
 
 CHUNK = 128 * 1024
-BASE = Path("/mnt/large/replicator")
+DIRS = []
 ALLOWED_HOSTS = {"files.pythonhosted.org", "mirror.osbeck.com"}
 
-
+class Hasher:
+    def __init__(self):
+        self.blake_hasher = hashlib.blake2b(digest_size=32)
+        self.sha256_hasher = hashlib.sha256()
+    def update(self, chunk):
+        self.blake_hasher.update(chunk)
+        self.sha256_hasher.update(chunk)
+    def save(self, filename):
+        os.setxattr(filename, b"user.blake2b", self.blake_hasher.hexdigest().encode())
+        os.setxattr(filename, b"user.sha256", self.sha256_hasher.hexdigest().encode())
+        
 class CacheEntry:
     def __init__(self, url):
         self.url = url
         # TODO validate for leading slash and ..
-        self.cache_path = BASE / Path(url.split("://", 1)[1])
-        self.have_length = threading.Event()
+        self.rel = Path(url.split("://", 1)[1])
+        self.cache_path = DIRS[0] / self.rel
+        self.have_length = threading.Condition()
+        self.mmap_created = threading.Event()
         self.file_complete = threading.Event()
         self.fd = None
         self.mmap = None
-        self.length = 0
+        self.length = None
         self.sofar = 0
 
     def check_already_cached(self) -> bool:
-        if self.cache_path.exists():
-            self.fd = open(self.cache_path, "rb")
-            self.length = self.cache_path.stat().st_size
-            self.sofar = self.length
-            self.mmap = mmap.mmap(self.fd.fileno(), self.length, prot=mmap.PROT_READ)
-            self.have_length.set()
-            self.file_complete.set()
-            return True
-        return False
+        """
+        Call with have_length held
+        """
+        if not self.cache_path.exists():
+            for d in DIRS:
+                p = Path(d, self.rel)
+                if p.exists():
+                    self.cache_path = p
+                    break
+            else:
+                return False
+
+        print(self.cache_path, "from cache")
+        self.fd = open(self.cache_path, "rb")
+        self.length = self.cache_path.stat().st_size
+        self.sofar = self.length
+        self.mmap = mmap.mmap(self.fd.fileno(), self.length, prot=mmap.PROT_READ)
+        self.mmap_created.set()
+        self.file_complete.set()
+        return True
 
     def send_to_client(self, wfile, cur=0):
-        self.have_length.wait()
+        self.mmap_created.wait()
         assert self.fd is not None, "send_to_client only after fd set"
         assert self.mmap is not None, "send_to_client only after mmap set"
         while True:
@@ -57,8 +81,7 @@ class CacheEntry:
             rem = min(self.sofar - cur, CHUNK)
 
             if rem == 0:
-                # print("sleep")
-                time.sleep(0.5)
+                time.sleep(0.01)
                 continue
             chunk = self.mmap[cur : cur + rem]
 
@@ -73,8 +96,8 @@ class CacheEntry:
             cur += len(chunk)
 
     def save_to_disk(self, rfile, length):
+        h = Hasher()
         with rfile:
-            self.length = length
             Path(self.cache_path).parent.mkdir(exist_ok=True, parents=True)
             assert self.fd is None, "Only call save_to_disk once"
             # TODO truncates for now, until I deal with header parsing more
@@ -85,10 +108,11 @@ class CacheEntry:
             self.fd.truncate()
 
             self.mmap = mmap.mmap(self.fd.fileno(), length)
-            self.have_length.set()
+            self.mmap_created.set()
             cur = 0
             while True:
                 chunk = rfile.read(CHUNK)
+                h.update(chunk)
                 if not chunk:
                     break
                 self.mmap[cur : cur + len(chunk)] = chunk
@@ -101,6 +125,8 @@ class CacheEntry:
         if cur == length:
             # rename and notify
             print("Rename", cur, length)
+            h.save(self.cache_path.as_posix() + ".incomplete")
+            os.setxattr(self.cache_path.as_posix() + ".incomplete", b"user.xdg.origin", self.url.encode("utf-8"))
             os.rename(self.cache_path.as_posix() + ".incomplete", self.cache_path)
             self.file_complete.set()
         else:
@@ -118,31 +144,36 @@ class ProxyHandler(BaseHTTPRequestHandler):
         else:
             url = self.path.replace("http://", "https://")
 
-        assert urllib.parse.urlparse(url).hostname in ALLOWED_HOSTS
+        if urllib.parse.urlparse(url).hostname not in ALLOWED_HOSTS:
+            self.send_response(403)
+            self.end_headers()
+            return
 
         with ACTIVE_CACHE_LOCK:
             ce = ACTIVE_CACHE.get(url)
             if ce is None:
                 ce = ACTIVE_CACHE[url] = CacheEntry(url)
-        if ce.check_already_cached() or ce.have_length.is_set():
-            self.send_response(200)
-            self.send_header("Connection", "close")
-            self.send_header("Content-Length", int(ce.length))
-            self.end_headers()
-            ce.send_to_client(self.wfile)
-        else:
-            p = urllib.parse.urlparse(url)
-            # TODO Handle port
-            resp = urllib.request.urlopen(url)
-            self.send_response(200)
-            self.send_header("Connection", "close")
-            threading.Thread(
-                target=ce.save_to_disk, args=(resp, int(resp.headers["content-length"]))
-            ).start()
-            ce.have_length.wait()
-            self.send_header("Content-Length", int(ce.length))
-            self.end_headers()
-            ce.send_to_client(self.wfile)
+
+        with ce.have_length:
+            if ce.length is None:
+                cached = ce.check_already_cached()
+
+                if not cached:
+                    p = urllib.parse.urlparse(url)
+                    # TODO Handle port
+                    resp = urllib.request.urlopen(url)
+                    length = int(resp.headers["content-length"])
+                    ce.length = length
+
+                    threading.Thread(
+                        target=ce.save_to_disk, args=(resp, length),
+                    ).start()
+
+        self.send_response(200)
+        self.send_header("Connection", "close")
+        self.send_header("Content-Length", ce.length)
+        self.end_headers()
+        ce.send_to_client(self.wfile)
 
 
 def coserv(*servers):
@@ -176,8 +207,10 @@ def run(
 @click.option("--http-port", default=80)
 @click.option("--https-port", default=443)
 @click.option("--user")
-def main(ssl_cert, ssl_key, http_port, https_port, user):
+@click.option("--dirs")
+def main(ssl_cert, ssl_key, http_port, https_port, user, dirs):
     logging.basicConfig(level=logging.DEBUG)
+    DIRS[:] = dirs.split(",")
     servers = [run(bind=("", http_port))]
     if ssl_key:
         servers.append(run(bind=("", https_port), ssl_cert=ssl_cert, ssl_key=ssl_key))
