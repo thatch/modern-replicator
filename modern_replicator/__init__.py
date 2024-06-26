@@ -1,3 +1,4 @@
+import pwd
 import logging
 import mmap
 import os
@@ -174,11 +175,14 @@ def run(
 @click.option("--ssl-key")
 @click.option("--http-port", default=80)
 @click.option("--https-port", default=443)
-def main(ssl_cert, ssl_key, http_port, https_port):
+@click.option("--user")
+def main(ssl_cert, ssl_key, http_port, https_port, user):
     logging.basicConfig(level=logging.DEBUG)
     servers = [run(bind=("", http_port))]
     if ssl_key:
         servers.append(run(bind=("", https_port), ssl_cert=ssl_cert, ssl_key=ssl_key))
+    if user:
+        os.setuid(pwd.getpwnam(user).pw_uid)
     coserv(*servers)
 
 
