@@ -25,7 +25,7 @@ import xattr
 
 CHUNK = 128 * 1024
 DIRS: list[Path] = []
-ALLOWED_HOSTS = {"files.pythonhosted.org", "mirror.osbeck.com"}
+ALLOWED_HOSTS = {"files.pythonhosted.org", "mirror.osbeck.com", "test-files.pythonhosted.org"}
 
 
 class Hasher:
@@ -91,7 +91,7 @@ class CacheEntry:
             else:
                 return False
 
-        print(self.cache_path, "from cache")
+        #print(self.cache_path, "from cache")
         self.fd = open(self.cache_path, "rb")
         self.length = self.cache_path.stat().st_size
         self.sofar = self.length
@@ -120,7 +120,7 @@ class CacheEntry:
                 if time.monotonic() - self.last_read_time > 1:
                     return  # error, too slow
                 time.sleep(0.1)
-                print(time.monotonic() - self.last_read_time)
+                #print(time.monotonic() - self.last_read_time)
                 continue
             chunk = self.mmap[cur : cur + rem]
             self.last_read_time = time.monotonic()
@@ -198,7 +198,7 @@ ACTIVE_CACHE_LOCK = threading.Lock()
 
 
 class ProxyHandler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:
+    def _get_cache_entry(self):
         if not self.path.startswith("http"):
             url = "https://" + self.headers["host"] + self.path
         else:
@@ -213,6 +213,25 @@ class ProxyHandler(BaseHTTPRequestHandler):
             ce = ACTIVE_CACHE.get(url)
             if ce is None:
                 ce = ACTIVE_CACHE[url] = CacheEntry(url)
+        return ce
+
+    def do_HEAD(self):
+        ce = self._get_cache_entry()
+
+        with ce.have_length:
+            if ce.length is None:
+                cached = ce.check_already_cached()
+                if cached:
+                    self.send_response(304)
+                    self.send_header("Connection", "close")
+                    self.send_header("Content-Length", 0)
+                    self.end_headers()
+                    return
+
+        return self.do_GET()
+
+    def do_GET(self):
+        ce = self._get_cache_entry()
 
         with ce.have_length:
             if ce.length is None:
