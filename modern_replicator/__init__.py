@@ -4,6 +4,7 @@ import logging
 import mmap
 import os
 import pwd
+import re
 import selectors
 import socketserver
 import ssl
@@ -16,6 +17,8 @@ import weakref
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import IO
+from typing import Optional, Tuple
+from urllib.error import HTTPError
 
 import click
 import xattr
@@ -45,6 +48,8 @@ class CacheEntry:
         # TODO validate for leading slash and ..
         self.rel = Path(url.split("://", 1)[1])
         self.cache_path = DIRS[0] / self.rel
+        if url.endswith("/"):
+            self.cache_path /= "index.html"
         self.have_length = threading.Condition()
         self.mmap_created = threading.Event()
         self.file_complete = threading.Event()
@@ -53,6 +58,7 @@ class CacheEntry:
         self.mmap: mmap.mmap | None = None
         self.length: int | None = None
         self.sofar: int = 0
+        self.last_read_time = 0
 
     def find_incomplete(self) -> int:
         """Scan .incomplete file backwards in CHUNK blocks to find resume offset."""
@@ -89,7 +95,8 @@ class CacheEntry:
         self.fd = open(self.cache_path, "rb")
         self.length = self.cache_path.stat().st_size
         self.sofar = self.length
-        self.mmap = mmap.mmap(self.fd.fileno(), self.length, prot=mmap.PROT_READ)
+        if self.length != 0:
+            self.mmap = mmap.mmap(self.fd.fileno(), self.length, prot=mmap.PROT_READ)
         self.mmap_created.set()
         self.file_complete.set()
         return True
@@ -100,18 +107,23 @@ class CacheEntry:
             return
         assert self.fd is not None, "send_to_client only after fd set"
         assert self.mmap is not None, "send_to_client only after mmap set"
+        self.last_read_time = time.monotonic()
         while True:
             if cur == self.length and self.file_complete.is_set():
                 # print("bail")
                 break
-            if self.download_error.is_set():
+            if self.download_error.is_set() or self.length == 0:
                 break
             rem = min(self.sofar - cur, CHUNK)
 
             if rem == 0:
-                time.sleep(0.01)
+                if time.monotonic() - self.last_read_time > 1:
+                    return  # error, too slow
+                time.sleep(0.1)
+                print(time.monotonic() - self.last_read_time)
                 continue
             chunk = self.mmap[cur : cur + rem]
+            self.last_read_time = time.monotonic()
 
             try:
                 wfile.write(chunk)
@@ -137,8 +149,8 @@ class CacheEntry:
                     self.fd.truncate()
                 else:
                     self.fd = open(incomplete, "r+b", buffering=0)
-
-                self.mmap = mmap.mmap(self.fd.fileno(), length)
+                if length != 0:
+                    self.mmap = mmap.mmap(self.fd.fileno(), length)
                 self.sofar = start
                 self.mmap_created.set()
                 while True:
