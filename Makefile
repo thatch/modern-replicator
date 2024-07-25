@@ -16,8 +16,7 @@ setup:
 
 .PHONY: test
 test:
-	python -m coverage run -m modern_replicator.tests $(TESTOPTS)
-	python -m coverage report
+	pytest --cov=modern_replicator -v
 
 .PHONY: format
 format:

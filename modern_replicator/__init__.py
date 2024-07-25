@@ -1,8 +1,8 @@
 import hashlib
-import pwd
 import logging
 import mmap
 import os
+import pwd
 import re
 import selectors
 import socketserver
@@ -16,6 +16,7 @@ import weakref
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional, Tuple
+from urllib.error import HTTPError
 
 import click
 
@@ -23,23 +24,29 @@ CHUNK = 128 * 1024
 DIRS = []
 ALLOWED_HOSTS = {"files.pythonhosted.org", "mirror.osbeck.com"}
 
+
 class Hasher:
     def __init__(self):
         self.blake_hasher = hashlib.blake2b(digest_size=32)
         self.sha256_hasher = hashlib.sha256()
+
     def update(self, chunk):
         self.blake_hasher.update(chunk)
         self.sha256_hasher.update(chunk)
+
     def save(self, filename):
         os.setxattr(filename, b"user.blake2b", self.blake_hasher.hexdigest().encode())
         os.setxattr(filename, b"user.sha256", self.sha256_hasher.hexdigest().encode())
-        
+
+
 class CacheEntry:
     def __init__(self, url):
         self.url = url
         # TODO validate for leading slash and ..
         self.rel = Path(url.split("://", 1)[1])
         self.cache_path = DIRS[0] / self.rel
+        if url.endswith("/"):
+            self.cache_path /= "index.html"
         self.have_length = threading.Condition()
         self.mmap_created = threading.Event()
         self.file_complete = threading.Event()
@@ -47,6 +54,7 @@ class CacheEntry:
         self.mmap = None
         self.length = None
         self.sofar = 0
+        self.last_read_time = 0
 
     def check_already_cached(self) -> bool:
         """
@@ -65,15 +73,19 @@ class CacheEntry:
         self.fd = open(self.cache_path, "rb")
         self.length = self.cache_path.stat().st_size
         self.sofar = self.length
-        self.mmap = mmap.mmap(self.fd.fileno(), self.length, prot=mmap.PROT_READ)
+        if self.length != 0:
+            self.mmap = mmap.mmap(self.fd.fileno(), self.length, prot=mmap.PROT_READ)
         self.mmap_created.set()
         self.file_complete.set()
         return True
 
     def send_to_client(self, wfile, cur=0):
         self.mmap_created.wait()
+        if self.length == 0:
+            return
         assert self.fd is not None, "send_to_client only after fd set"
         assert self.mmap is not None, "send_to_client only after mmap set"
+        self.last_read_time = time.monotonic()
         while True:
             if cur == self.length and self.file_complete.is_set():
                 # print("bail")
@@ -81,9 +93,13 @@ class CacheEntry:
             rem = min(self.sofar - cur, CHUNK)
 
             if rem == 0:
-                time.sleep(0.01)
+                if time.monotonic() - self.last_read_time > 1:
+                    return  # error, too slow
+                time.sleep(0.1)
+                print(time.monotonic() - self.last_read_time)
                 continue
             chunk = self.mmap[cur : cur + rem]
+            self.last_read_time = time.monotonic()
 
             try:
                 wfile.write(chunk)
@@ -107,7 +123,8 @@ class CacheEntry:
             self.fd.seek(length, os.SEEK_SET)
             self.fd.truncate()
 
-            self.mmap = mmap.mmap(self.fd.fileno(), length)
+            if length != 0:
+                self.mmap = mmap.mmap(self.fd.fileno(), length)
             self.mmap_created.set()
             cur = 0
             while True:
@@ -126,7 +143,11 @@ class CacheEntry:
             # rename and notify
             print("Rename", cur, length)
             h.save(self.cache_path.as_posix() + ".incomplete")
-            os.setxattr(self.cache_path.as_posix() + ".incomplete", b"user.xdg.origin", self.url.encode("utf-8"))
+            os.setxattr(
+                self.cache_path.as_posix() + ".incomplete",
+                b"user.xdg.origin",
+                self.url.encode("utf-8"),
+            )
             os.rename(self.cache_path.as_posix() + ".incomplete", self.cache_path)
             self.file_complete.set()
         else:
@@ -161,12 +182,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 if not cached:
                     p = urllib.parse.urlparse(url)
                     # TODO Handle port
-                    resp = urllib.request.urlopen(url)
+                    try:
+                        resp = urllib.request.urlopen(url)
+                    except HTTPError as e:
+                        self.send_response(e.code)
+                        self.end_headers()
+                        return
                     length = int(resp.headers["content-length"])
                     ce.length = length
 
                     threading.Thread(
-                        target=ce.save_to_disk, args=(resp, length),
+                        target=ce.save_to_disk,
+                        args=(resp, length),
                     ).start()
 
         self.send_response(200)
