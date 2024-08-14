@@ -22,7 +22,15 @@ import click
 
 CHUNK = 128 * 1024
 DIRS = []
-ALLOWED_HOSTS = {"files.pythonhosted.org", "mirror.osbeck.com", "test-files.pythonhosted.org"}
+ALLOWED_HOSTS = {
+    # pypi artifacts
+    "files.pythonhosted.org",
+    "test-files.pythonhosted.org",
+    # an arbitrary archlinux mirror
+    "mirror.osbeck.com",
+    # docker registry bulk objects
+    "production.cloudflare.docker.com",
+}
 
 
 class Hasher:
