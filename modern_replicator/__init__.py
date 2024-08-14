@@ -99,7 +99,7 @@ class CacheEntry:
             else:
                 return False
 
-        #print(self.cache_path, "from cache")
+        # print(self.cache_path, "from cache")
         self.fd = open(self.cache_path, "rb")
         self.length = self.cache_path.stat().st_size
         self.sofar = self.length
@@ -109,26 +109,27 @@ class CacheEntry:
         self.file_complete.set()
         return True
 
-    def send_to_client(self, wfile: io.BufferedIOBase, cur: int = 0) -> None:
+    def send_to_client(self, wfile: io.BufferedIOBase, cur: int = 0, stop=None) -> None:
         self.mmap_created.wait()
         if self.download_error.is_set():
             return
         assert self.fd is not None, "send_to_client only after fd set"
         assert self.mmap is not None, "send_to_client only after mmap set"
         self.last_read_time = time.monotonic()
+        if stop is None:
+            stop = self.length
         while True:
-            if cur == self.length and self.file_complete.is_set():
-                # print("bail")
+            if cur == stop:
                 break
             if self.download_error.is_set() or self.length == 0:
                 break
-            rem = min(self.sofar - cur, CHUNK)
+            rem = min(min(self.sofar, stop) - cur, CHUNK)
 
-            if rem == 0:
+            if rem <= 0:
                 if time.monotonic() - self.last_read_time > 1:
                     return  # error, too slow
                 time.sleep(0.1)
-                #print(time.monotonic() - self.last_read_time)
+                # print(time.monotonic() - self.last_read_time)
                 continue
             chunk = self.mmap[cur : cur + rem]
             self.last_read_time = time.monotonic()
@@ -225,6 +226,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         ce = self._get_cache_entry()
+        if ce is None:
+            return
 
         with ce.have_length:
             if ce.length is None:
@@ -240,6 +243,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         ce = self._get_cache_entry()
+        if ce is None:
+            return
 
         with ce.have_length:
             if ce.length is None:
@@ -263,12 +268,35 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         args=(resp, length, start),
                     ).start()
 
-        assert ce.length is not None
-        self.send_response(200)
+        cr = self.headers.get("range")
+        if cr:
+            unit, rest = cr.split("=", 1)
+            if unit != "bytes" or "," in rest:
+                self.send_response(416)
+                self.end_headers()
+                return
+            a, b = rest.split("-")
+            if not a:  # bytes=-{length}
+                t = int(b)
+                a = ce.length - t
+                if a < 0:
+                    a = 0
+                b = ce.length
+            else:  # bytes={start}- or bytes={start}-{end}
+                b = (int(b) + 1) if b else ce.length
+                a = int(a) if a else 0
+
+            self.send_response(206)
+            self.send_header("Content-Range", "%d-%d/%d" % (a, b - 1, ce.length))
+            self.send_header("Content-Length", str(b - a))
+        else:
+            a, b = 0, ce.length
+            self.send_response(200)
+            self.send_header("Content-Length", ce.length)
+
         self.send_header("Connection", "close")
-        self.send_header("Content-Length", str(ce.length))
         self.end_headers()
-        ce.send_to_client(self.wfile)
+        ce.send_to_client(self.wfile, a, b)
 
 
 def coserv(*servers: ThreadingHTTPServer) -> None:
