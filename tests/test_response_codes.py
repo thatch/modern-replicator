@@ -31,14 +31,38 @@ def test_200():
         assert lines[0] == "HTTP/1.0 200 OK"
         # 1 Server
         # 2 Date
-        assert lines[3] == "Connection: close"
-        assert lines[4] == "Content-Length: 0"
+        assert lines[3] == "Content-Length: 0"
+        assert lines[4] == "Connection: close"
         assert lines[5] == ""
         p = Path(td, "httpbin.org", "status", "200")
         while not p.exists():
             time.sleep(0.1)
         assert p.read_text() == ""
-    
+
+def test_206():
+    ALLOWED_HOSTS.add("timhatch.com")
+    with tempfile.TemporaryDirectory(delete=False) as td:
+        DIRS[:] = [td]
+        conn = ConnectionFake(
+            b"GET /projects/http-tests/sequence_100.txt HTTP/1.0\r\nHost: timhatch.com\r\nRange: bytes=2-4\r\n\r\n",
+        )
+        ProxyHandler(conn, ("127.0.0.1", 1234), None)
+        lines = conn.wfile.getvalue().decode("latin-1").splitlines()
+        print(list(enumerate(lines)))
+        assert lines[0] == "HTTP/1.0 206 Partial Content"
+        # 1 Server
+        # 2 Date
+        assert lines[3] == "Content-Range: 2-4/292"
+        assert lines[4] == "Content-Length: 3"
+        assert lines[5] == "Connection: close"
+        assert lines[6] == ""
+        assert lines[7] == "2"
+        assert lines[8] == "3"
+        assert len(lines) == 9
+        p = Path(td, "timhatch.com", "projects", "http-tests", "sequence_100.txt")
+        while not p.exists():
+            time.sleep(0.1)
+        assert p.read_text() == "".join([f"{i}\n" for i in range(1, 100+1)])
 
 def test_404():
     ALLOWED_HOSTS.add("httpbin.org")
