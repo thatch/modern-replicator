@@ -1,8 +1,8 @@
 import hashlib
-import pwd
 import logging
 import mmap
 import os
+import pwd
 import re
 import selectors
 import socketserver
@@ -23,17 +23,21 @@ CHUNK = 128 * 1024
 DIRS = []
 ALLOWED_HOSTS = {"files.pythonhosted.org", "mirror.osbeck.com"}
 
+
 class Hasher:
     def __init__(self):
         self.blake_hasher = hashlib.blake2b(digest_size=32)
         self.sha256_hasher = hashlib.sha256()
+
     def update(self, chunk):
         self.blake_hasher.update(chunk)
         self.sha256_hasher.update(chunk)
+
     def save(self, filename):
         os.setxattr(filename, b"user.blake2b", self.blake_hasher.hexdigest().encode())
         os.setxattr(filename, b"user.sha256", self.sha256_hasher.hexdigest().encode())
-        
+
+
 class CacheEntry:
     def __init__(self, url):
         self.url = url
@@ -43,6 +47,7 @@ class CacheEntry:
         self.have_length = threading.Condition()
         self.mmap_created = threading.Event()
         self.file_complete = threading.Event()
+        self.download_error = threading.Event()
         self.fd = None
         self.mmap = None
         self.length = None
@@ -72,11 +77,15 @@ class CacheEntry:
 
     def send_to_client(self, wfile, cur=0):
         self.mmap_created.wait()
+        if self.download_error.is_set():
+            return
         assert self.fd is not None, "send_to_client only after fd set"
         assert self.mmap is not None, "send_to_client only after mmap set"
         while True:
             if cur == self.length and self.file_complete.is_set():
                 # print("bail")
+                break
+            if self.download_error.is_set():
                 break
             rem = min(self.sofar - cur, CHUNK)
 
@@ -97,40 +106,57 @@ class CacheEntry:
 
     def save_to_disk(self, rfile, length):
         h = Hasher()
-        with rfile:
-            Path(self.cache_path).parent.mkdir(exist_ok=True, parents=True)
-            assert self.fd is None, "Only call save_to_disk once"
-            # TODO truncates for now, until I deal with header parsing more
-            self.fd = open(
-                self.cache_path.as_posix() + ".incomplete", "w+b", buffering=0
-            )
-            self.fd.seek(length, os.SEEK_SET)
-            self.fd.truncate()
+        cur = 0
+        try:
+            with rfile:
+                Path(self.cache_path).parent.mkdir(exist_ok=True, parents=True)
+                assert self.fd is None, "Only call save_to_disk once"
+                # TODO truncates for now, until I deal with header parsing more
+                self.fd = open(
+                    self.cache_path.as_posix() + ".incomplete", "w+b", buffering=0
+                )
+                self.fd.seek(length, os.SEEK_SET)
+                self.fd.truncate()
 
-            self.mmap = mmap.mmap(self.fd.fileno(), length)
-            self.mmap_created.set()
-            cur = 0
-            while True:
-                chunk = rfile.read(CHUNK)
-                h.update(chunk)
-                if not chunk:
-                    break
-                self.mmap[cur : cur + len(chunk)] = chunk
-                cur += len(chunk)
-                # print(cur, self.fd.tell())
-                self.sofar = cur
-                sys.stderr.write(".")
-                sys.stderr.flush()
+                self.mmap = mmap.mmap(self.fd.fileno(), length)
+                self.mmap_created.set()
+                while True:
+                    chunk = rfile.read(CHUNK)
+                    h.update(chunk)
+                    if not chunk:
+                        break
+                    self.mmap[cur : cur + len(chunk)] = chunk
+                    cur += len(chunk)
+                    # print(cur, self.fd.tell())
+                    self.sofar = cur
+                    sys.stderr.write(".")
+                    sys.stderr.flush()
 
-        if cur == length:
-            # rename and notify
-            print("Rename", cur, length)
-            h.save(self.cache_path.as_posix() + ".incomplete")
-            os.setxattr(self.cache_path.as_posix() + ".incomplete", b"user.xdg.origin", self.url.encode("utf-8"))
-            os.rename(self.cache_path.as_posix() + ".incomplete", self.cache_path)
-            self.file_complete.set()
-        else:
-            print("ERROR", cur, length)
+            if cur == length:
+                # rename and notify
+                print("Rename", cur, length)
+                h.save(self.cache_path.as_posix() + ".incomplete")
+                os.setxattr(
+                    self.cache_path.as_posix() + ".incomplete",
+                    b"user.xdg.origin",
+                    self.url.encode("utf-8"),
+                )
+                os.rename(self.cache_path.as_posix() + ".incomplete", self.cache_path)
+                self.file_complete.set()
+                return
+        except Exception:
+            pass
+
+        print("ERROR", cur, length)
+        self.mmap_created.set()  # unblock any waiters so they can see download_error
+        self.download_error.set()
+        with ACTIVE_CACHE_LOCK:
+            if ACTIVE_CACHE.get(self.url) is self:
+                del ACTIVE_CACHE[self.url]
+        try:
+            os.unlink(self.cache_path.as_posix() + ".incomplete")
+        except OSError:
+            pass
 
 
 ACTIVE_CACHE = weakref.WeakValueDictionary()
@@ -166,7 +192,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     ce.length = length
 
                     threading.Thread(
-                        target=ce.save_to_disk, args=(resp, length),
+                        target=ce.save_to_disk,
+                        args=(resp, length),
                     ).start()
 
         self.send_response(200)
