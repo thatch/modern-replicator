@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import IO
 
 import click
+import xattr
 
 CHUNK = 128 * 1024
 DIRS: list[Path] = []
@@ -34,8 +35,8 @@ class Hasher:
         self.sha256_hasher.update(chunk)
 
     def save(self, filename: str) -> None:
-        os.setxattr(filename, b"user.blake2b", self.blake_hasher.hexdigest().encode())
-        os.setxattr(filename, b"user.sha256", self.sha256_hasher.hexdigest().encode())
+        xattr.setxattr(filename, "user.blake2b", self.blake_hasher.hexdigest().encode())
+        xattr.setxattr(filename, "user.sha256", self.sha256_hasher.hexdigest().encode())
 
 
 class CacheEntry:
@@ -159,7 +160,7 @@ class CacheEntry:
                 for i in range(0, length, CHUNK):
                     h.update(self.mmap[i : i + CHUNK])
                 h.save(incomplete)
-                os.setxattr(incomplete, b"user.xdg.origin", self.url.encode("utf-8"))
+                xattr.setxattr(incomplete, "user.xdg.origin", self.url.encode("utf-8"))
                 os.rename(incomplete, self.cache_path)
                 self.file_complete.set()
                 return

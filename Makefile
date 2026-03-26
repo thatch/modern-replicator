@@ -33,5 +33,5 @@ format:
 .PHONY: lint
 lint:
 	ruff check
-	python -m checkdeps --allow-names modern_replicator modern_replicator
+	python -m checkdeps --allow-names modern_replicator,xattr modern_replicator
 	mypy --strict --install-types --non-interactive modern_replicator
