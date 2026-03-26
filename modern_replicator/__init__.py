@@ -4,6 +4,7 @@ import logging
 import mmap
 import os
 import pwd
+import re
 import selectors
 import socketserver
 import ssl
@@ -16,13 +17,23 @@ import weakref
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import IO
+from typing import Optional, Tuple
+from urllib.error import HTTPError
 
 import click
 import xattr
 
 CHUNK = 128 * 1024
 DIRS: list[Path] = []
-ALLOWED_HOSTS = {"files.pythonhosted.org", "mirror.osbeck.com"}
+ALLOWED_HOSTS = {
+    # pypi artifacts
+    "files.pythonhosted.org",
+    "test-files.pythonhosted.org",
+    # an arbitrary archlinux mirror
+    "mirror.osbeck.com",
+    # docker registry bulk objects
+    "production.cloudflare.docker.com",
+}
 
 
 class Hasher:
@@ -45,6 +56,8 @@ class CacheEntry:
         # TODO validate for leading slash and ..
         self.rel = Path(url.split("://", 1)[1])
         self.cache_path = DIRS[0] / self.rel
+        if url.endswith("/"):
+            self.cache_path /= "index.html"
         self.have_length = threading.Condition()
         self.mmap_created = threading.Event()
         self.file_complete = threading.Event()
@@ -53,6 +66,7 @@ class CacheEntry:
         self.mmap: mmap.mmap | None = None
         self.length: int | None = None
         self.sofar: int = 0
+        self.last_read_time = 0
 
     def find_incomplete(self) -> int:
         """Scan .incomplete file backwards in CHUNK blocks to find resume offset."""
@@ -85,33 +99,40 @@ class CacheEntry:
             else:
                 return False
 
-        print(self.cache_path, "from cache")
+        # print(self.cache_path, "from cache")
         self.fd = open(self.cache_path, "rb")
         self.length = self.cache_path.stat().st_size
         self.sofar = self.length
-        self.mmap = mmap.mmap(self.fd.fileno(), self.length, prot=mmap.PROT_READ)
+        if self.length != 0:
+            self.mmap = mmap.mmap(self.fd.fileno(), self.length, prot=mmap.PROT_READ)
         self.mmap_created.set()
         self.file_complete.set()
         return True
 
-    def send_to_client(self, wfile: io.BufferedIOBase, cur: int = 0) -> None:
+    def send_to_client(self, wfile: io.BufferedIOBase, cur: int = 0, stop=None) -> None:
         self.mmap_created.wait()
         if self.download_error.is_set():
             return
         assert self.fd is not None, "send_to_client only after fd set"
         assert self.mmap is not None, "send_to_client only after mmap set"
+        self.last_read_time = time.monotonic()
+        if stop is None:
+            stop = self.length
         while True:
-            if cur == self.length and self.file_complete.is_set():
-                # print("bail")
+            if cur == stop:
                 break
-            if self.download_error.is_set():
+            if self.download_error.is_set() or self.length == 0:
                 break
-            rem = min(self.sofar - cur, CHUNK)
+            rem = min(min(self.sofar, stop) - cur, CHUNK)
 
-            if rem == 0:
-                time.sleep(0.01)
+            if rem <= 0:
+                if time.monotonic() - self.last_read_time > 1:
+                    return  # error, too slow
+                time.sleep(0.1)
+                # print(time.monotonic() - self.last_read_time)
                 continue
             chunk = self.mmap[cur : cur + rem]
+            self.last_read_time = time.monotonic()
 
             try:
                 wfile.write(chunk)
@@ -137,8 +158,8 @@ class CacheEntry:
                     self.fd.truncate()
                 else:
                     self.fd = open(incomplete, "r+b", buffering=0)
-
-                self.mmap = mmap.mmap(self.fd.fileno(), length)
+                if length != 0:
+                    self.mmap = mmap.mmap(self.fd.fileno(), length)
                 self.sofar = start
                 self.mmap_created.set()
                 while True:
@@ -186,7 +207,7 @@ ACTIVE_CACHE_LOCK = threading.Lock()
 
 
 class ProxyHandler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:
+    def _get_cache_entry(self):
         if not self.path.startswith("http"):
             url = "https://" + self.headers["host"] + self.path
         else:
@@ -201,6 +222,29 @@ class ProxyHandler(BaseHTTPRequestHandler):
             ce = ACTIVE_CACHE.get(url)
             if ce is None:
                 ce = ACTIVE_CACHE[url] = CacheEntry(url)
+        return ce
+
+    def do_HEAD(self):
+        ce = self._get_cache_entry()
+        if ce is None:
+            return
+
+        with ce.have_length:
+            if ce.length is None:
+                cached = ce.check_already_cached()
+                if cached:
+                    self.send_response(304)
+                    self.send_header("Connection", "close")
+                    self.send_header("Content-Length", 0)
+                    self.end_headers()
+                    return
+
+        return self.do_GET()
+
+    def do_GET(self):
+        ce = self._get_cache_entry()
+        if ce is None:
+            return
 
         with ce.have_length:
             if ce.length is None:
@@ -224,12 +268,35 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         args=(resp, length, start),
                     ).start()
 
-        assert ce.length is not None
-        self.send_response(200)
+        cr = self.headers.get("range")
+        if cr:
+            unit, rest = cr.split("=", 1)
+            if unit != "bytes" or "," in rest:
+                self.send_response(416)
+                self.end_headers()
+                return
+            a, b = rest.split("-")
+            if not a:  # bytes=-{length}
+                t = int(b)
+                a = ce.length - t
+                if a < 0:
+                    a = 0
+                b = ce.length
+            else:  # bytes={start}- or bytes={start}-{end}
+                b = (int(b) + 1) if b else ce.length
+                a = int(a) if a else 0
+
+            self.send_response(206)
+            self.send_header("Content-Range", "%d-%d/%d" % (a, b - 1, ce.length))
+            self.send_header("Content-Length", str(b - a))
+        else:
+            a, b = 0, ce.length
+            self.send_response(200)
+            self.send_header("Content-Length", ce.length)
+
         self.send_header("Connection", "close")
-        self.send_header("Content-Length", str(ce.length))
         self.end_headers()
-        ce.send_to_client(self.wfile)
+        ce.send_to_client(self.wfile, a, b)
 
 
 def coserv(*servers: ThreadingHTTPServer) -> None:
