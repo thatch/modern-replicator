@@ -24,8 +24,8 @@ TODO
 
 # Version Compat
 
-Usage of this library should work back to 3.7, but development (and mypy
-compatibility) only on 3.10-3.12.  Linting requires 3.12 for full fidelity.
+This library is compatile with Python 3.10+, but should be linted under the
+newest stable version.
 
 # Versioning
 
