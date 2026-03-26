@@ -53,6 +53,24 @@ class CacheEntry:
         self.length = None
         self.sofar = 0
 
+    def find_incomplete(self) -> int:
+        """Scan .incomplete file backwards in CHUNK blocks to find resume offset."""
+        incomplete = Path(self.cache_path.as_posix() + ".incomplete")
+        if not incomplete.exists():
+            return 0
+        size = incomplete.stat().st_size
+        if size == 0:
+            return 0
+        with open(incomplete, "rb") as f:
+            m = mmap.mmap(f.fileno(), size, prot=mmap.PROT_READ)
+            offset = size
+            while offset > 0:
+                block_start = max(0, offset - CHUNK)
+                if any(m[block_start:offset]):
+                    return block_start
+                offset = block_start
+        return 0
+
     def check_already_cached(self) -> bool:
         """
         Call with have_length held
@@ -104,25 +122,26 @@ class CacheEntry:
                 print("ERROR")
             cur += len(chunk)
 
-    def save_to_disk(self, rfile, length):
-        h = Hasher()
-        cur = 0
+    def save_to_disk(self, rfile, length, start=0):
+        cur = start
         try:
             with rfile:
                 Path(self.cache_path).parent.mkdir(exist_ok=True, parents=True)
                 assert self.fd is None, "Only call save_to_disk once"
-                # TODO truncates for now, until I deal with header parsing more
-                self.fd = open(
-                    self.cache_path.as_posix() + ".incomplete", "w+b", buffering=0
-                )
-                self.fd.seek(length, os.SEEK_SET)
-                self.fd.truncate()
+                incomplete = self.cache_path.as_posix() + ".incomplete"
+                if start == 0:
+                    # TODO truncates for now, until I deal with header parsing more
+                    self.fd = open(incomplete, "w+b", buffering=0)
+                    self.fd.seek(length, os.SEEK_SET)
+                    self.fd.truncate()
+                else:
+                    self.fd = open(incomplete, "r+b", buffering=0)
 
                 self.mmap = mmap.mmap(self.fd.fileno(), length)
+                self.sofar = start
                 self.mmap_created.set()
                 while True:
                     chunk = rfile.read(CHUNK)
-                    h.update(chunk)
                     if not chunk:
                         break
                     self.mmap[cur : cur + len(chunk)] = chunk
@@ -135,13 +154,13 @@ class CacheEntry:
             if cur == length:
                 # rename and notify
                 print("Rename", cur, length)
-                h.save(self.cache_path.as_posix() + ".incomplete")
-                os.setxattr(
-                    self.cache_path.as_posix() + ".incomplete",
-                    b"user.xdg.origin",
-                    self.url.encode("utf-8"),
-                )
-                os.rename(self.cache_path.as_posix() + ".incomplete", self.cache_path)
+                incomplete = self.cache_path.as_posix() + ".incomplete"
+                h = Hasher()
+                for i in range(0, length, CHUNK):
+                    h.update(self.mmap[i : i + CHUNK])
+                h.save(incomplete)
+                os.setxattr(incomplete, b"user.xdg.origin", self.url.encode("utf-8"))
+                os.rename(incomplete, self.cache_path)
                 self.file_complete.set()
                 return
         except Exception:
@@ -185,15 +204,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 cached = ce.check_already_cached()
 
                 if not cached:
-                    p = urllib.parse.urlparse(url)
-                    # TODO Handle port
-                    resp = urllib.request.urlopen(url)
-                    length = int(resp.headers["content-length"])
+                    start = ce.find_incomplete()
+                    req = urllib.request.Request(url)
+                    if start:
+                        req.add_header("Range", f"bytes={start}-")
+                    resp = urllib.request.urlopen(req)
+                    if start and resp.status == 206:
+                        length = int(resp.headers["Content-Range"].split("/")[-1])
+                    else:
+                        length = int(resp.headers["content-length"])
+                        start = 0
                     ce.length = length
 
                     threading.Thread(
                         target=ce.save_to_disk,
-                        args=(resp, length),
+                        args=(resp, length, start),
                     ).start()
 
         self.send_response(200)

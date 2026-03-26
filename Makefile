@@ -4,7 +4,7 @@ else
     ACTIVATE:=.venv/bin/activate
 endif
 
-UV:=$(shell uv --version)
+UV:=$(shell uv --version 2>/dev/null)
 ifdef UV
 	VENV:=uv venv
 	PIP:=uv pip
