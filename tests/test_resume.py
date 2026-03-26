@@ -128,8 +128,8 @@ def test_save_to_disk_fresh_error(ce):
 def test_resume_completes_file(ce):
     """save_to_disk(start=CHUNK) splices in the remaining bytes correctly."""
     total = CHUNK * 3
-    first_part = b"\xAB" * CHUNK
-    second_part = b"\xCD" * (CHUNK * 2)
+    first_part = b"\xab" * CHUNK
+    second_part = b"\xcd" * (CHUNK * 2)
 
     write_incomplete(ce, first_part, total)
 
@@ -221,7 +221,7 @@ def _setup_ce_with_data(ce, data):
 
 def test_send_to_client_complete(ce):
     """send_to_client streams the full content to wfile."""
-    data = b"\xAB" * 5000
+    data = b"\xab" * 5000
     _setup_ce_with_data(ce, data)
 
     buf = io.BytesIO()
@@ -233,7 +233,7 @@ def test_send_to_client_ssl_eof(ce):
     """SSLEOFError during write causes clean exit."""
     import ssl
 
-    data = b"\xAB" * 5000
+    data = b"\xab" * 5000
     _setup_ce_with_data(ce, data)
 
     class SSLFile:
@@ -279,7 +279,7 @@ def test_send_to_client_download_error_mid_stream(ce):
 def test_send_to_client_streams_while_downloading(ce):
     """send_to_client can stream data while save_to_disk is still writing."""
     total = 5000
-    data = b"\xCC" * total
+    data = b"\xcc" * total
 
     ce.length = total  # normally set by do_GET before the thread starts
     rfile = io.BytesIO(data)
